@@ -1,0 +1,10 @@
+{application, atomvm_erlc, [
+    {description, "erlc compatible Erlang compiler running on AtomVM"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.
