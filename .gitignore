@@ -1,0 +1,5 @@
+/_build/
+/_checkouts/
+*.dump
+*.crashdump
+erl_crash.dump
