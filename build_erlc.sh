@@ -47,7 +47,8 @@ STDLIB_MODULES="${STDLIB_MODULES:-erl_scan erl_parse erl_lint erl_anno epp
     erl_internal erl_features erl_bits otp_internal erl_eval eval_bits erl_error
     ordsets orddict dict gb_sets gb_trees digraph digraph_utils sofs
     beam_lib filelib graph records erl_expand_records erl_pp rand
-    io_lib io_lib_format io_lib_fread io_lib_pretty string unicode_util}"
+    io_lib io_lib_format io_lib_fread io_lib_pretty string unicode_util
+    ms_transform}"
 
 cp "$COMPILER_EBIN"/*.beam "$OUT/ebin/"
 for m in $STDLIB_MODULES; do
