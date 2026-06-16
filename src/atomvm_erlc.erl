@@ -112,14 +112,25 @@ compile_files(#{files := Files} = Config) ->
         false -> error
     end.
 
-%% Compile in a dedicated process so each file starts from a fresh heap.
+%% Compile in a dedicated process so each file starts from a fresh heap. The
+%% worker exits with reason `normal` (passing its result by message) so the VM
+%% does not format/print a crash report per file — a non-trivial fixed cost when
+%% compiling many files, and noise that BEAM's erlc never emits.
 compile_one_in_proc(File, Config) ->
+    Parent = self(),
     {Pid, Ref} = spawn_opt(
-        fun() -> exit(compile_one(File, Config)) end,
-        [monitor]
+        fun() -> Parent ! {self(), compile_one(File, Config)} end,
+        [monitor, {min_heap_size, 2000000}]
     ),
     receive
-        {'DOWN', Ref, process, Pid, Result} -> Result
+        {Pid, Result} ->
+            receive
+                {'DOWN', Ref, process, Pid, _} -> ok
+            end,
+            Result;
+        {'DOWN', Ref, process, Pid, Reason} ->
+            % worker died before sending a result (e.g. out of memory)
+            {error, Reason}
     end.
 
 compile_one(File, #{out := Out, includes := Includes, defines := Defines, opts := ExtraOpts}) ->
@@ -129,7 +140,11 @@ compile_one(File, #{out := Out, includes := Includes, defines := Defines, opts :
             false -> [report_warnings]
         end,
     Opts =
-        [report_errors, {outdir, Out}]
+        % no_spawn_compiler_process: this front-end already runs each file in
+        % its own process (compile_one_in_proc), so the compiler's internal
+        % worker spawn is redundant -- and its exit({ok,Module}) would trigger a
+        % per-file crash report. Running in-process avoids both.
+        [report_errors, no_spawn_compiler_process, {outdir, Out}]
             ++ WarnOpts
             ++ [{i, Dir} || Dir <- Includes]
             ++ Defines
