@@ -20,10 +20,27 @@ set -e
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ATOMVM_BUILD="${ATOMVM_BUILD:-$HOME/AtomVM/build.release}"
-TARGET="${TARGET:-aarch64}"
-OTP_LIB="${OTP_LIB:-/opt/local/lib/erlang/lib}"
-PATH="/opt/local/bin:$PATH"
-export PATH
+
+# Prefer MacPorts when it is installed, so a local OTP 29 wins over an older
+# system erl. CI runners have no /opt/local and use OTP from the default PATH.
+if [ -d /opt/local/bin ]; then
+    PATH="/opt/local/bin:$PATH"
+    export PATH
+fi
+
+# Default the JIT target to the host architecture, and the OTP library
+# directory to whichever erl is on PATH, so this runs unchanged on CI.
+if [ -z "$TARGET" ]; then
+    case "$(uname -m)" in
+        arm64 | aarch64) TARGET="aarch64" ;;
+        x86_64 | amd64) TARGET="x86_64" ;;
+        *)
+            echo "Unsupported host architecture: $(uname -m)" >&2
+            exit 1
+            ;;
+    esac
+fi
+OTP_LIB="${OTP_LIB:-$(erl -noshell -eval 'io:format("~s",[code:lib_dir()]),halt().')}"
 
 OUT="$HERE/_build"
 AOT="$OUT/aot"
