@@ -87,15 +87,19 @@ jobs:
           curl -fsSL -o mbedtls.tar.bz2 \
             "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2"
           tar xf mbedtls.tar.bz2
+          # Install to a dedicated prefix rather than /usr/local, which is the
+          # Homebrew prefix on Intel runners: adding that to CMake's search
+          # path could pull in a Homebrew zlib and make the binary
+          # non-portable.
           cmake -S "mbedtls-${MBEDTLS_VERSION}" -B mbedtls-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/mbedtls-prefix" \
             -DUSE_STATIC_MBEDTLS_LIBRARY=On \
             -DUSE_SHARED_MBEDTLS_LIBRARY=Off \
             -DENABLE_TESTING=Off \
             -DENABLE_PROGRAMS=Off
           cmake --build mbedtls-build
-          sudo cmake --install mbedtls-build
+          cmake --install mbedtls-build
 
       # AVM_STATIC_MBEDTLS only takes effect on the find_library path;
       # CMAKE_DISABLE_FIND_PACKAGE_MbedTLS keeps CMake off the package path,
@@ -105,11 +109,31 @@ jobs:
       - name: Configure AtomVM
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
+            # CMake finds the shared zlib by default, which -static cannot
+            # link. Ask the compiler for the static archive zlib1g-dev ships,
+            # which avoids hardcoding the multiarch triplet.
+            ZLIB_A="$(${CC:-gcc} -print-file-name=libz.a)"
+            case "$ZLIB_A" in
+              /*) ;;
+              *)
+                echo "FAIL: libz.a not found, zlib1g-dev is required"
+                exit 1
+                ;;
+            esac
             EXTRA="-DCMAKE_EXE_LINKER_FLAGS=-static"
+            EXTRA="$EXTRA -DZLIB_INCLUDE_DIR=/usr/include"
+            EXTRA="$EXTRA -DZLIB_LIBRARY=${ZLIB_A}"
           else
             # check_symbol_exists() only searches the compiler's default
             # include path, so point CMake at the static Mbed-TLS built above.
-            EXTRA="-DCMAKE_C_FLAGS=-I/usr/local/include -DCMAKE_LIBRARY_PATH=/usr/local/lib"
+            # Pin zlib to the SDK too, so a Homebrew copy cannot slip in and
+            # leave the binary depending on a library users will not have.
+            PREFIX="${{ github.workspace }}/mbedtls-prefix"
+            SDK="$(xcrun --show-sdk-path)"
+            EXTRA="-DCMAKE_C_FLAGS=-I${PREFIX}/include"
+            EXTRA="$EXTRA -DCMAKE_LIBRARY_PATH=${PREFIX}/lib"
+            EXTRA="$EXTRA -DZLIB_INCLUDE_DIR=${SDK}/usr/include"
+            EXTRA="$EXTRA -DZLIB_LIBRARY=${SDK}/usr/lib/libz.tbd"
           fi
           cmake -S AtomVM -B AtomVM/build.release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
