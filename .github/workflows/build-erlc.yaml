@@ -25,6 +25,9 @@ env:
   # OTP 29 is both the build toolchain (the OTP compiler and stdlib beams are
   # packed into the binary) and the benchmark baseline.
   OTP_VERSION: "29"
+  # PackBEAM and uf2tool are rebar3 projects, so CMake requires rebar3 to
+  # configure AtomVM at all.
+  REBAR3_VERSION: "3.25.1"
   MBEDTLS_VERSION: "3.6.4"
 
 jobs:
@@ -64,6 +67,7 @@ jobs:
         uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
           version-type: loose
 
       - name: Install build dependencies (Linux)
@@ -100,9 +104,12 @@ jobs:
       # macOS has no static libc, so libSystem stays dynamic there.
       - name: Configure AtomVM
         run: |
-          EXTRA=""
           if [ "${{ runner.os }}" = "Linux" ]; then
             EXTRA="-DCMAKE_EXE_LINKER_FLAGS=-static"
+          else
+            # check_symbol_exists() only searches the compiler's default
+            # include path, so point CMake at the static Mbed-TLS built above.
+            EXTRA="-DCMAKE_C_FLAGS=-I/usr/local/include -DCMAKE_LIBRARY_PATH=/usr/local/lib"
           fi
           cmake -S AtomVM -B AtomVM/build.release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -110,7 +117,15 @@ jobs:
             -DAVM_PRECOMPILED_TARGETS="${{ matrix.arch }}" \
             -DAVM_STATIC_MBEDTLS=ON \
             -DCMAKE_DISABLE_FIND_PACKAGE_MbedTLS=ON \
-            $EXTRA
+            $EXTRA 2>&1 | tee configure.log
+          # Mbed-TLS is only a warning to AtomVM, but this binary cannot work
+          # without it: the OTP compiler calls erlang:md5/1 for every module.
+          # Fail here rather than ship a silently crypto-less erlc.
+          if grep -q "Could NOT find MbedTLS" configure.log; then
+            echo "FAIL: Mbed-TLS was not detected, erlang:md5/1 would be unavailable"
+            exit 1
+          fi
+          grep -m1 "Found MbedTLS with" configure.log
 
       - name: Build AtomVM
         run: cmake --build AtomVM/build.release --target AtomVM PackBEAM atomvmlib
