@@ -25,6 +25,13 @@ env:
   # OTP 29 is both the build toolchain (the OTP compiler and stdlib beams are
   # packed into the binary) and the benchmark baseline.
   OTP_VERSION: "29"
+  # The benchmark corpus: every application in this OTP source tree is compiled
+  # by both compilers. Pinned to a tag so the corpus does not drift between
+  # runs; only the sources are read, nothing is built from it.
+  OTP_SOURCE_REF: "OTP-29.0"
+  # Timed runs per application per compiler. One pass over the whole tree is
+  # ~65s for BEAM erlc, so 3 runs plus the discovery pass is roughly 15 minutes.
+  BENCH_RUNS: "3"
   # PackBEAM and uf2tool are rebar3 projects, so CMake requires rebar3 to
   # configure AtomVM at all.
   REBAR3_VERSION: "3.25.1"
@@ -34,6 +41,9 @@ jobs:
   build:
     name: ${{ matrix.os }} (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    # The benchmark bounds each compiler invocation itself; this only stops a
+    # runner from idling for hours if something below that wedges.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -201,15 +211,30 @@ jobs:
             | grep -qx 3628800
           echo "OK: emitted a valid, correct BEAM module"
 
+      # Fetched late, and shallow: this is a large repository that is only
+      # needed as benchmark input, so nothing earlier has to wait on it.
+      - name: Checkout Erlang/OTP ${{ env.OTP_SOURCE_REF }} source
+        uses: actions/checkout@v4
+        with:
+          repository: erlang/otp
+          ref: ${{ env.OTP_SOURCE_REF }}
+          path: otp
+          fetch-depth: 1
+
+      # The benchmark exits non-zero when AtomVM erlc is slower in total, which
+      # is a result to report rather than a build failure -- hence `|| true`.
       - name: Benchmark against erlc ${{ env.OTP_VERSION }}
         run: |
-          python3 bench_erlc.py --runs 15 \
+          python3 bench_otp_erlc.py \
+            --otp otp \
+            --runs "${BENCH_RUNS}" \
             --atomvm-erlc "${GITHUB_WORKSPACE}/_build/erlc" \
             --beam-erlc "$(command -v erlc)" 2>&1 | tee bench.txt || true
           {
             echo "### ${{ matrix.os }} (${{ matrix.arch }})"
             echo
-            echo "AtomVM \`${ATOMVM_SHA}\` (\`${ATOMVM_REF}\`) vs BEAM erlc from OTP ${OTP_VERSION}."
+            echo "AtomVM \`${ATOMVM_SHA}\` (\`${ATOMVM_REF}\`) vs BEAM erlc from OTP ${OTP_VERSION},"
+            echo "compiling every application in the ${OTP_SOURCE_REF} source tree."
             echo "Ratios above 1.00x mean AtomVM erlc is faster."
             echo
             echo '```'
