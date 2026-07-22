@@ -147,6 +147,7 @@ jobs:
           fi
           cmake -S AtomVM -B AtomVM/build.release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
             -DAVM_DISABLE_JIT=OFF \
             -DAVM_PRECOMPILED_TARGETS="${{ matrix.arch }}" \
             -DAVM_STATIC_MBEDTLS=ON \
