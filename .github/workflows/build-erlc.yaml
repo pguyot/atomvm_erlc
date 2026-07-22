@@ -84,7 +84,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev
+          sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev libpcre2-dev
 
       # Homebrew ships Mbed-TLS as shared libraries only, so build a static one
       # from source. Mbed-TLS is not optional for this binary: the OTP compiler
@@ -133,6 +133,12 @@ jobs:
             EXTRA="-DCMAKE_EXE_LINKER_FLAGS=-static"
             EXTRA="$EXTRA -DZLIB_INCLUDE_DIR=/usr/include"
             EXTRA="$EXTRA -DZLIB_LIBRARY=${ZLIB_A}"
+            # Same story for PCRE2 (the re module): find_library would pick
+            # the shared object, which -static cannot link.
+            PCRE2_A="$(${CC:-gcc} -print-file-name=libpcre2-8.a)"
+            case "$PCRE2_A" in
+              /*) EXTRA="$EXTRA -DPCRE2_8_LIBRARY=${PCRE2_A}" ;;
+            esac
           else
             # check_symbol_exists() only searches the compiler's default
             # include path, so point CMake at the static Mbed-TLS built above.
