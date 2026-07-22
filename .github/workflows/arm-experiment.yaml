@@ -31,11 +31,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { variant: "gcc-base",   cc: "gcc",   lto: "OFF", reloc: "OFF" }
-          - { variant: "gcc-lto",    cc: "gcc",   lto: "ON",  reloc: "OFF" }
-          - { variant: "clang-base", cc: "clang", lto: "OFF", reloc: "OFF" }
-          - { variant: "clang-lto",  cc: "clang", lto: "ON",  reloc: "OFF" }
-          - { variant: "gcc-lto-reloc", cc: "gcc", lto: "ON", reloc: "ON" }
+          - { variant: "gcc-base",   cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "ON" }
+          - { variant: "gcc-nosmp",  cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "OFF" }
+          - { variant: "gcc-perf",   cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "ON" }
 
     steps:
       - name: Checkout atomvm_erlc
@@ -75,13 +73,18 @@ jobs:
           else
             RELOC="-DAVM_PRECOMPILED_TARGETS=aarch64"
           fi
+          if [ "${{ matrix.smp }}" = "OFF" ]; then
+            SMP="-DAVM_DISABLE_SMP=ON"
+          else
+            SMP=""
+          fi
           cmake -S AtomVM -B AtomVM/build.release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=${{ matrix.lto }} \
             -DAVM_DISABLE_JIT=OFF \
             -DAVM_STATIC_MBEDTLS=ON \
             -DCMAKE_DISABLE_FIND_PACKAGE_MbedTLS=ON \
-            $TOOLCHAIN $RELOC
+            $TOOLCHAIN $RELOC $SMP
           cmake --build AtomVM/build.release --target AtomVM PackBEAM atomvmlib
 
       - name: Build erlc
@@ -103,7 +106,49 @@ jobs:
           path: otp
           fetch-depth: 1
 
+      - name: Perf profile (gcc-perf lane)
+        if: matrix.variant == 'gcc-perf'
+        run: |
+          sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic || true
+          echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid || true
+          PERF="$(ls /usr/lib/linux-tools*/*/perf /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || command -v perf)"
+          echo "using perf: $PERF"
+          "$PERF" version || true
+          # one batched kernel-app compile under perf, mirroring the bench setup
+          python3 - "$PERF" <<'PYEOF2'
+          import glob, subprocess, sys, tempfile, os
+          perf = sys.argv[1]
+          otp = "otp"
+          inc = []
+          for d in sorted(glob.glob(otp + "/lib/*/include")):
+              inc += ["-I", d]
+          inc += ["-I", otp + "/erts/include", "-I", otp + "/lib"]
+          inc += ["-I", otp + "/lib/kernel/src", "-I", otp + "/lib/kernel/include"]
+          files = sorted(glob.glob(otp + "/lib/kernel/src/*.erl"))
+          out = tempfile.mkdtemp()
+          erlc = os.environ["GITHUB_WORKSPACE"] + "/_build/erlc"
+          cmd = [perf, "record", "-F", "499", "-g", "-o", "perf.data", "--", erlc, "-o", out] + inc + files
+          subprocess.run(cmd, timeout=1200)
+          PYEOF2
+          "$PERF" report --stdio -i perf.data --no-children --percent-limit 0.5 2>/dev/null | head -100 | tee perf-report.txt
+          {
+            echo "### gcc-perf: perf report (kernel app batch)"
+            echo '```'
+            cat perf-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          "$PERF" stat -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,L1-dcache-load-misses -- "${GITHUB_WORKSPACE}/_build/erlc" -o /tmp/perfstatout -I otp/lib -I otp/lib/kernel/src otp/lib/kernel/src/*.erl 2>&1 | tail -20 | tee -a perf-report.txt || true
+
+      - name: Upload perf report
+        if: matrix.variant == 'gcc-perf'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: perf-report.txt
+          if-no-files-found: warn
+
       - name: Benchmark subset
+        if: matrix.variant != 'gcc-perf'
         run: |
           python3 bench_otp_erlc.py \
             --otp otp \
@@ -119,6 +164,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark results
+        if: matrix.variant != 'gcc-perf'
         uses: actions/upload-artifact@v4
         with:
           name: bench-experiment-${{ matrix.variant }}
