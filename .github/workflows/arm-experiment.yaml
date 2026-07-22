@@ -1,0 +1,123 @@
+#
+#  Copyright 2026 Paul Guyot <pguyot@kallisys.net>
+#
+#  SPDX-License-Identifier: Apache-2.0 OR LGPL-2.1-or-later
+#
+# Temporary experiment: bisect the Linux-aarch64 performance gap
+# (bench 0.66x vs 0.85-1.11x on Apple silicon) across toolchain and
+# build-flag variants. Benchmarks a fast subset (stdlib + kernel).
+
+name: ARM Linux experiment
+
+on:
+  workflow_dispatch:
+
+env:
+  ATOMVM_REPOSITORY: "pguyot/AtomVM"
+  ATOMVM_REF: "w27/jit-pinned-regs"
+  OTP_VERSION: "29"
+  OTP_SOURCE_REF: "OTP-29.0"
+  REBAR3_VERSION: "3.25.1"
+
+jobs:
+  experiment:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: "gcc-base",   cc: "gcc",   lto: "OFF", reloc: "OFF" }
+          - { variant: "gcc-lto",    cc: "gcc",   lto: "ON",  reloc: "OFF" }
+          - { variant: "clang-base", cc: "clang", lto: "OFF", reloc: "OFF" }
+          - { variant: "clang-lto",  cc: "clang", lto: "ON",  reloc: "OFF" }
+          - { variant: "gcc-lto-reloc", cc: "gcc", lto: "ON", reloc: "ON" }
+
+    steps:
+      - name: Checkout atomvm_erlc
+        uses: actions/checkout@v4
+
+      - name: Checkout AtomVM (${{ env.ATOMVM_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ATOMVM_REPOSITORY }}
+          ref: ${{ env.ATOMVM_REF }}
+          path: AtomVM
+
+      - name: Install Erlang/OTP ${{ env.OTP_VERSION }}
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+          version-type: loose
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev
+          if [ "${{ matrix.cc }}" = "clang" ]; then
+            sudo apt-get install -y clang lld
+          fi
+
+      - name: Configure and build AtomVM
+        run: |
+          if [ "${{ matrix.cc }}" = "clang" ]; then
+            TOOLCHAIN="-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++"
+          else
+            TOOLCHAIN=""
+          fi
+          if [ "${{ matrix.reloc }}" = "ON" ]; then
+            RELOC="-DAVM_JIT_RELOC=ON -DAVM_PRECOMPILED_TARGETS=aarch64+reloc"
+          else
+            RELOC="-DAVM_PRECOMPILED_TARGETS=aarch64"
+          fi
+          cmake -S AtomVM -B AtomVM/build.release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=${{ matrix.lto }} \
+            -DAVM_DISABLE_JIT=OFF \
+            -DAVM_STATIC_MBEDTLS=ON \
+            -DCMAKE_DISABLE_FIND_PACKAGE_MbedTLS=ON \
+            $TOOLCHAIN $RELOC
+          cmake --build AtomVM/build.release --target AtomVM PackBEAM atomvmlib
+
+      - name: Build erlc
+        env:
+          ATOMVM_BUILD: ${{ github.workspace }}/AtomVM/build.release
+        run: |
+          if [ "${{ matrix.reloc }}" = "ON" ]; then
+            export TARGET="aarch64+reloc"
+          else
+            export TARGET="aarch64"
+          fi
+          ./build_erlc.sh
+
+      - name: Checkout Erlang/OTP ${{ env.OTP_SOURCE_REF }} source
+        uses: actions/checkout@v4
+        with:
+          repository: erlang/otp
+          ref: ${{ env.OTP_SOURCE_REF }}
+          path: otp
+          fetch-depth: 1
+
+      - name: Benchmark subset
+        run: |
+          python3 bench_otp_erlc.py \
+            --otp otp \
+            --runs 2 \
+            --atomvm-erlc "${GITHUB_WORKSPACE}/_build/erlc" \
+            --beam-erlc "$(command -v erlc)" \
+            stdlib kernel 2>&1 | tee bench.txt || true
+          {
+            echo "### ${{ matrix.variant }}"
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-experiment-${{ matrix.variant }}
+          path: bench.txt
+          if-no-files-found: error
