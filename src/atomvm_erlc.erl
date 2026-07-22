@@ -38,8 +38,30 @@ main(Args) ->
             error
     end.
 
+%% Entry point for the emscripten (Node.js) build. There, AtomVM's
+%% platform main does not forward the process argv to the Erlang program --
+%% it runs this start/0 with no arguments -- so the Node wrapper passes the
+%% command line through the ATOMVM_ERLC_ARGV environment variable instead,
+%% one argument per line. The native build never arrives here with that
+%% variable meaningful: it enters through main/1 with the real argv (the
+%% escript convention), so reading the variable only affects the Node build.
 start() ->
-    main([]).
+    main(env_args("ATOMVM_ERLC_ARGV")).
+
+env_args(Var) ->
+    case os:getenv(Var) of
+        Value when is_list(Value), Value =/= "" ->
+            split_lines(Value, [], []);
+        _ ->
+            []
+    end.
+
+split_lines([$\n | Rest], Cur, Acc) ->
+    split_lines(Rest, [], [lists:reverse(Cur) | Acc]);
+split_lines([C | Rest], Cur, Acc) ->
+    split_lines(Rest, [C | Cur], Acc);
+split_lines([], Cur, Acc) ->
+    lists:reverse([lists:reverse(Cur) | Acc]).
 
 usage() ->
     io:format(

@@ -1,0 +1,134 @@
+#
+#  Copyright 2026 Paul Guyot <pguyot@kallisys.net>
+#
+#  SPDX-License-Identifier: Apache-2.0 OR LGPL-2.1-or-later
+#
+
+# Builds the Node.js flavour of erlc: the same AOT-compiled bundle as the native
+# binary, but targeting wasm32 and run on AtomVM's Emscripten build under Node.
+#
+# This is expected to be RED until AtomVM's wasm32 JIT backend is brought back in
+# sync (libs/jit/src/jit_wasm32.erl has not been maintained since 2026-06-06 and
+# a precompiled/runtime wasm32 program currently aborts with a call_indirect
+# signature mismatch). Nothing in this repository can fix that; once wasm32 is
+# green in the pinned AtomVM revision this workflow goes green with no change.
+
+name: Build erlc (Node.js)
+
+on:
+  push:
+    branches:
+      - main
+      - 'w[0-9][0-9]/**'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ATOMVM_REPOSITORY: "pguyot/AtomVM"
+  ATOMVM_REF: "w27/jit-pinned-regs"
+  OTP_VERSION: "29"
+  REBAR3_VERSION: "3.25.1"
+
+jobs:
+  build:
+    name: node (wasm32)
+    # The Emscripten output (AtomVM.mjs + AtomVM.wasm + erlc.avm) is portable,
+    # so a single host build produces an artifact that runs under Node anywhere.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout atomvm_erlc
+        uses: actions/checkout@v4
+
+      - name: Checkout AtomVM (${{ env.ATOMVM_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ATOMVM_REPOSITORY }}
+          ref: ${{ env.ATOMVM_REF }}
+          path: AtomVM
+
+      - name: Record AtomVM revision
+        run: echo "ATOMVM_SHA=$(git -C AtomVM rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Erlang/OTP ${{ env.OTP_VERSION }}
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+          version-type: loose
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev
+
+      - name: Install Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      # Host build: only the Erlang-side pieces are needed -- the wasm32
+      # precompiler beams, PackBEAM, and the emscripten library precompiled to
+      # wasm32. No native AtomVM binary is produced or required, so wasm32 is
+      # added to AVM_PRECOMPILED_TARGETS and JIT DWARF is left off so wasm32 is
+      # actually emitted.
+      - name: Configure host AtomVM (wasm32 precompiled library)
+        run: |
+          cmake -S AtomVM -B AtomVM/build.host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAVM_DISABLE_JIT=OFF \
+            -DAVM_DISABLE_JIT_DWARF=ON \
+            -DAVM_PRECOMPILED_TARGETS=wasm32
+
+      - name: Build wasm32 library, PackBEAM and precompiler
+        run: cmake --build AtomVM/build.host --target atomvmlib-emscripten PackBEAM
+
+      # Emscripten runtime: the AtomVM.mjs + AtomVM.wasm that runs the wasm32 AOT
+      # code under Node. JIT is left enabled: the runtime registers the AOT wasm
+      # functions through addFunction at load, which needs the JIT link flags.
+      - name: Configure Emscripten AtomVM
+        run: |
+          emcmake cmake -S AtomVM/src/platforms/emscripten -B AtomVM/build.emsdk \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release -DAVM_DISABLE_JIT=OFF
+
+      - name: Build Emscripten AtomVM
+        run: cmake --build AtomVM/build.emsdk --target AtomVM
+
+      - name: Build erlc (Node.js)
+        env:
+          ATOMVM_BUILD: ${{ github.workspace }}/AtomVM/build.host
+          ATOMVM_MJS_DIR: ${{ github.workspace }}/AtomVM/build.emsdk/src
+        run: ./build_erlc_node.sh
+
+      - name: Smoke test (Node.js)
+        run: |
+          mkdir -p smoke && cd smoke
+          cat > smoke_test.erl <<'EOF'
+          -module(smoke_test).
+          -export([fact/1]).
+          fact(0) -> 1;
+          fact(N) when N > 0 -> N * fact(N - 1).
+          EOF
+          node "${GITHUB_WORKSPACE}/_build/node/erlc.mjs" -o . smoke_test.erl
+          test -f smoke_test.beam
+          # The emitted module must be loadable and correct on BEAM itself.
+          erl -noshell -pa . -eval 'io:format("~p~n", [smoke_test:fact(10)]), halt().' \
+            | grep -qx 3628800
+          echo "OK: Node.js erlc emitted a valid, correct BEAM module"
+
+      - name: Upload Node.js erlc bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: erlc-node-wasm32
+          path: |
+            _build/node/erlc.mjs
+            _build/node/erlc.avm
+            _build/node/AtomVM.mjs
+            _build/node/AtomVM.wasm
+          if-no-files-found: warn
