@@ -7,18 +7,22 @@
 # source tree: every application under lib/<app>/src, plus erts/preloaded/src.
 #
 # Both compilers get the same file list and the same broad include path (every
-# lib/*/include, erts/include, the OTP lib root for -include_lib, and the app's
-# own src and include dirs).
+# lib/*/include and lib/*/src, erts/include, the OTP lib root for -include_lib,
+# and the app's own src and include dirs first), plus the per-application
+# version macros that OTP's own Makefiles inject (see APP_MACROS).
 #
 # Fairness: a file only one compiler can build would otherwise distort the
-# ratio -- a compiler that bails out early looks arbitrarily fast. So each app
-# is first compiled once by each compiler to discover which .beam files each
-# actually produces; only the intersection is timed. Neither front-end aborts
-# the batch on a failing file, so that discovery pass sees every file.
+# ratio, so each app is compiled by each compiler to discover which .beam files
+# each actually produces, and only the intersection is timed. Discovery is done
+# PER FILE, not from a single batch: BEAM erlc aborts a whole batch at the first
+# file that fails to compile, leaving every file after it uncompiled, which
+# would make a large part of the corpus look unsupported when only one file
+# (often a missing version macro) actually failed. See discover().
 #
-# Each app is then compiled as a single batched invocation (RUNS times per
-# compiler, median wall time reported). Batching is deliberate: it amortises VM
-# startup over the app the way a real build does, instead of letting a fixed
+# The intersection is then compiled as a single batched invocation (RUNS times
+# per compiler, median wall time reported). Every file in it compiles on both
+# compilers, so no batch aborts. Batching is deliberate: it amortises VM startup
+# over the app the way a real build does, instead of letting a fixed
 # per-invocation startup difference dominate on apps made of many small files.
 #
 # Usage: bench_otp_erlc.py [--otp DIR] [--runs N] [--atomvm-erlc PATH]
@@ -95,6 +99,21 @@ def beam_emu_flavor(beam_erlc):
     return flavor, detail
 
 
+# A few applications reference a version macro that their OTP Makefile injects
+# on the erlc command line (e.g. compiler/src/Makefile passes -DCOMPILER_VSN,
+# dialyzer uses ?VSN). Without it those files do not compile on ANY erlc, so
+# they would be dropped from the corpus for a reason that has nothing to do
+# with AtomVM. Inject the same macros, per application, so the file is timed.
+# The value is irrelevant to compile time and both compilers get it identically;
+# a placeholder is enough. Injected per app rather than globally because some
+# unrelated modules (e.g. kernel/group_history) define VSN themselves and a
+# global -DVSN would collide ("redefining macro").
+APP_MACROS = {
+    "compiler": ['-DCOMPILER_VSN="0"'],
+    "dialyzer": ['-DVSN="0"'],
+}
+
+
 def base_includes(otp: Path):
     inc = []
     for d in sorted(glob.glob(str(otp / "lib/*/include"))):
@@ -103,6 +122,12 @@ def base_includes(otp: Path):
     # The OTP lib root resolves -include_lib("<app>/include/<hdr>.hrl"): epp's
     # path_open tries the full "app/include/hdr.hrl" against each -I dir first.
     inc += ["-I", str(otp / "lib")]
+    # Every application's src dir, so private headers one app keeps in src/ and
+    # another includes are found (erts/preloaded, for instance, includes
+    # kernel/src/inet_int.hrl). The app's own src is placed ahead of this list
+    # in main() so its own headers win on any name collision.
+    for d in sorted(glob.glob(str(otp / "lib/*/src"))):
+        inc += ["-I", d]
     return inc
 
 
@@ -131,10 +156,33 @@ def compile_batch(erlc, files, inc, timeout):
         return elapsed, produced
 
 
+def discover(erlc, files, inc, timeout):
+    """Set of file stems this compiler can produce a .beam for.
+
+    A single batch would be a fair discovery only if the compiler compiled the
+    whole batch: BEAM erlc ABORTS the entire batch at the first file that fails,
+    so every file after the failing one is left uncompiled and would look
+    unsupported. (The AtomVM front-end compiles each file in its own process and
+    never aborts, so its batch is already complete.) When the batch is short of
+    the full set, probe the still-missing files one at a time to tell a real
+    failure from a file that merely came after an abort point. With the version
+    macros injected most applications compile whole, so the per-file fallback
+    only runs for the few files that genuinely fail on a compiler.
+    """
+    _, produced = compile_batch(erlc, files, inc, timeout)
+    if len(produced) == len(files):
+        return produced
+    for f in files:
+        if f.stem not in produced:
+            _, one = compile_batch(erlc, [f], inc, timeout)
+            produced |= one
+    return produced
+
+
 def common_files(files, beam_erlc, atomvm_erlc, inc, timeout):
     """Files both compilers actually produce a .beam for."""
-    _, b_ok = compile_batch(beam_erlc, files, inc, timeout)
-    _, a_ok = compile_batch(atomvm_erlc, files, inc, timeout)
+    b_ok = discover(beam_erlc, files, inc, timeout)
+    a_ok = discover(atomvm_erlc, files, inc, timeout)
     both = b_ok & a_ok
     return [f for f in files if f.stem in both], b_ok, a_ok
 
@@ -159,6 +207,7 @@ def main():
     print(f"# beam flavor: {flavor} ({detail})")
     print(f"# atomvm erlc: {args.atomvm_erlc}")
     print(f"# runs per app per compiler: {args.runs} (median wall time, batched, startup included)")
+    print("# support discovered per file (BEAM erlc aborts a batch at the first error);")
     print("# only files BOTH compilers compile are timed; 'skip' counts the rest")
     print()
 
@@ -178,7 +227,10 @@ def main():
         files = sorted(srcdir.glob("*.erl"))
         if not files:
             continue
-        inc = inc_base + ["-I", str(srcdir), "-I", str(srcdir.parent / "include")]
+        # The app's own src/include first, so its headers win over any
+        # same-named header another app keeps in its src dir (inc_base).
+        inc = (["-I", str(srcdir), "-I", str(srcdir.parent / "include")]
+               + inc_base + APP_MACROS.get(app, []))
 
         common, b_ok, a_ok = common_files(files, args.beam_erlc, args.atomvm_erlc,
                                           inc, args.timeout)
