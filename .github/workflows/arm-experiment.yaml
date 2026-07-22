@@ -10,6 +10,9 @@
 name: ARM Linux experiment
 
 on:
+  push:
+    branches:
+      - 'w29/arm-experiment'
   workflow_dispatch:
 
 env:

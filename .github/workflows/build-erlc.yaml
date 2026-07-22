@@ -7,11 +7,6 @@
 name: Build erlc binaries
 
 on:
-  push:
-    branches:
-      - main
-      - 'w[0-9][0-9]/**'
-  pull_request:
   workflow_dispatch:
 
 concurrency:
