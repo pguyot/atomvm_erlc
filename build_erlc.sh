@@ -72,6 +72,15 @@ for m in $STDLIB_MODULES; do
     cp "$STDLIB_EBIN/$m.beam" "$OUT/ebin/"
 done
 
+# parse transforms (and their runtime deps) that OTP sources compile with;
+# BEAM's erlc finds these in the installed OTP, so bundle them for parity
+EUNIT_EBIN=$(ls -d "$OTP_LIB"/eunit-*/ebin | head -1)
+SYNTAX_TOOLS_EBIN=$(ls -d "$OTP_LIB"/syntax_tools-*/ebin | head -1)
+cp "$EUNIT_EBIN/eunit_autoexport.beam" "$OUT/ebin/"
+for m in merl merl_transform erl_syntax erl_syntax_lib erl_comment_scan; do
+    cp "$SYNTAX_TOOLS_EBIN/$m.beam" "$OUT/ebin/"
+done
+
 # --- 3. AOT precompile ---------------------------------------------------------
 echo "==> jit_precompile $TARGET ($(ls "$OUT/ebin" | wc -l | tr -d ' ') beams)"
 erl -pa "$JIT_BEAMS" -noshell -s jit_precompile -s init stop -- \
