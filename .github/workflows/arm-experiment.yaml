@@ -31,9 +31,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { variant: "gcc-base",   cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "ON" }
-          - { variant: "gcc-nosmp",  cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "OFF" }
-          - { variant: "gcc-perf",   cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "ON" }
+          - { variant: "gcc-base",   cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "ON", mtune: "" }
+          - { variant: "gcc-mtune",  cc: "gcc",   lto: "OFF", reloc: "OFF", smp: "ON", mtune: "neoverse-n2" }
 
     steps:
       - name: Checkout atomvm_erlc
@@ -77,6 +76,9 @@ jobs:
             SMP="-DAVM_DISABLE_SMP=ON"
           else
             SMP=""
+          fi
+          if [ -n "${{ matrix.mtune }}" ]; then
+            SMP="$SMP -DCMAKE_C_FLAGS=-mtune=${{ matrix.mtune }}"
           fi
           cmake -S AtomVM -B AtomVM/build.release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
