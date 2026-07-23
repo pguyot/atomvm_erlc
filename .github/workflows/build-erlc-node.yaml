@@ -6,12 +6,8 @@
 
 # Builds the Node.js flavour of erlc: the same AOT-compiled bundle as the native
 # binary, but targeting wasm32 and run on AtomVM's Emscripten build under Node.
-#
-# This is expected to be RED until AtomVM's wasm32 JIT backend is brought back in
-# sync (libs/jit/src/jit_wasm32.erl has not been maintained since 2026-06-06 and
-# a precompiled/runtime wasm32 program currently aborts with a call_indirect
-# signature mismatch). Nothing in this repository can fix that; once wasm32 is
-# green in the pinned AtomVM revision this workflow goes green with no change.
+# Verified end to end: the bundle compiles a real .erl file under Node (reading
+# and writing through AtomVM's -sNODERAWFS runtime) and emits a correct BEAM.
 
 name: Build erlc (Node.js)
 
