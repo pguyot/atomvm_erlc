@@ -21,7 +21,7 @@ concurrency:
 env:
   # AtomVM revision the binaries are built from.
   ATOMVM_REPOSITORY: "pguyot/AtomVM"
-  ATOMVM_REF: "w27/jit-pinned-regs"
+  ATOMVM_REF: "w30/jit-edge"
   # OTP 29 is both the build toolchain (the OTP compiler and stdlib beams are
   # packed into the binary) and the benchmark baseline.
   OTP_VERSION: "29"

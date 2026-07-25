@@ -25,7 +25,7 @@ concurrency:
 
 env:
   ATOMVM_REPOSITORY: "pguyot/AtomVM"
-  ATOMVM_REF: "w27/jit-pinned-regs"
+  ATOMVM_REF: "w30/jit-edge"
   OTP_VERSION: "29"
   REBAR3_VERSION: "3.25.1"
 
