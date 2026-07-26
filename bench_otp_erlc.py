@@ -25,8 +25,15 @@
 # over the app the way a real build does, instead of letting a fixed
 # per-invocation startup difference dominate on apps made of many small files.
 #
+# --max-bytes caps the corpus by source size. It exists for flavours whose cost
+# per module is not merely a constant factor above the native binaries: the
+# wasm32 build spends about a second on a 5 KB module and half an hour on a
+# 150 KB one, so without a cap a single module decides the whole run. Off by
+# default, so the native flavours compile every application in full.
+#
 # Usage: bench_otp_erlc.py [--otp DIR] [--runs N] [--atomvm-erlc PATH]
-#                          [--beam-erlc PATH] [--timeout S] [app ...]
+#                          [--beam-erlc PATH] [--timeout S] [--max-bytes N]
+#                          [app ...]
 
 import argparse
 import glob
@@ -52,6 +59,8 @@ def parse_args():
                     help="timed runs per app per compiler (default: 3)")
     ap.add_argument("--timeout", type=int, default=int(os.environ.get("TIMEOUT", "900")),
                     help="per-invocation timeout in seconds (default: 900)")
+    ap.add_argument("--max-bytes", type=int, default=int(os.environ.get("MAX_BYTES", "0")),
+                    help="skip sources larger than this many bytes (0: no cap)")
     ap.add_argument("apps", nargs="*", help="restrict to these applications")
     args = ap.parse_args()
 
@@ -209,6 +218,9 @@ def main():
     print(f"# runs per app per compiler: {args.runs} (median wall time, batched, startup included)")
     print("# support discovered per file (BEAM erlc aborts a batch at the first error);")
     print("# only files BOTH compilers compile are timed; 'skip' counts the rest")
+    if args.max_bytes:
+        print(f"# CAPPED CORPUS: sources over {args.max_bytes} bytes are excluded, "
+              "so these numbers are not comparable to an uncapped run")
     print()
 
     hdr = (f"{'application':<18} {'files':>5} {'skip':>4} "
@@ -225,6 +237,8 @@ def main():
         if only and app not in only:
             continue
         files = sorted(srcdir.glob("*.erl"))
+        if args.max_bytes:
+            files = [f for f in files if f.stat().st_size <= args.max_bytes]
         if not files:
             continue
         # The app's own src/include first, so its headers win over any

@@ -22,8 +22,13 @@
 # --atomvm-erlc may be any executable, so the Node.js flavour is benchmarked by
 # pointing it at _build/node/erlc.mjs (it carries a `node` shebang).
 #
+# --max-bytes caps the corpus by source size, as in bench_otp_erlc.py: the
+# wasm32 flavour costs about a second on a 5 KB module and half an hour on a
+# 150 KB one, so a bounded run has to bound the module size. Off by default.
+#
 # Usage: bench_otp_perfile.py [--otp DIR] [--runs N] [--atomvm-erlc PATH]
-#                             [--beam-erlc PATH] [--timeout S] [app ...]
+#                             [--beam-erlc PATH] [--timeout S] [--max-bytes N]
+#                             [app ...]
 
 import argparse
 import os
@@ -49,6 +54,8 @@ def parse_args():
                     help="timed runs per file per compiler (default: 3)")
     ap.add_argument("--timeout", type=int, default=int(os.environ.get("TIMEOUT", "900")),
                     help="per-invocation timeout in seconds (default: 900)")
+    ap.add_argument("--max-bytes", type=int, default=int(os.environ.get("MAX_BYTES", "0")),
+                    help="skip sources larger than this many bytes (0: no cap)")
     ap.add_argument("apps", nargs="*", default=[],
                     help=f"applications to benchmark (default: {' '.join(DEFAULT_APPS)})")
     args = ap.parse_args()
@@ -93,6 +100,9 @@ def main():
     print(f"# runs per file per compiler: {args.runs} "
           f"(median wall time, ONE invocation per file, startup included)")
     print("# only files BOTH compilers compile are timed; the rest are listed as skipped")
+    if args.max_bytes:
+        print(f"# CAPPED CORPUS: sources over {args.max_bytes} bytes are excluded, "
+              "so these numbers are not comparable to an uncapped run")
 
     hdr = (f"{'file':<28} {'bytes':>7} {'beam (ms)':>10} "
            f"{'atomvm (ms)':>12} {'ratio':>8}")
@@ -114,7 +124,10 @@ def main():
         print("-" * len(hdr))
         app_beam = app_atomvm = 0.0
         app_files = 0
-        for src in sorted(srcdir.glob("*.erl")):
+        sources = sorted(srcdir.glob("*.erl"))
+        if args.max_bytes:
+            sources = [s for s in sources if s.stat().st_size <= args.max_bytes]
+        for src in sources:
             beam, beam_ok = time_file(args.beam_erlc, src, inc, args.runs, args.timeout)
             atomvm, atomvm_ok = time_file(args.atomvm_erlc, src, inc, args.runs, args.timeout)
             if not (beam_ok and atomvm_ok):
