@@ -51,6 +51,22 @@ env:
   # so it runs over four representative applications rather than the whole tree:
   # two large ones and two small ones.
   BENCH_PERFILE_APPS: "kernel stdlib crypto sasl"
+  # The wasm32 flavour is not a constant factor slower than the native ones:
+  # its cost per module grows superlinearly with the module, so a single large
+  # source decides the whole run. Measured wasm32-under-Node vs the native
+  # binary, same AtomVM revision:
+  #
+  #   shell_default.erl     6 KB     3.1s  vs 0.03s
+  #   edlin_key.erl        13 KB     8.6s  vs 0.03s
+  #   rb.erl               39 KB   191s    vs 0.12s
+  #   crypto (2 files)    186 KB  1738s    vs 0.67s   <- on the CI runner
+  #
+  # That last row is why this job used to run past its timeout without ever
+  # reaching kernel and stdlib: the first application alone took half an hour
+  # per pass. So the node corpus is one small application, capped by source
+  # size -- 9 of sasl's 17 modules, none of them pathological.
+  BENCH_NODE_APPS: "sasl"
+  BENCH_NODE_MAX_BYTES: "10000"
   # PackBEAM and uf2tool are rebar3 projects, so CMake requires rebar3 to
   # configure AtomVM at all.
   REBAR3_VERSION: "3.25.1"
@@ -311,7 +327,7 @@ jobs:
       - name: Benchmark whole applications
         if: ${{ !matrix.cross }}
         run: |
-          python3 bench_otp_erlc.py \
+          python3 -u bench_otp_erlc.py \
             --otp otp \
             --runs "${BENCH_RUNS}" \
             --atomvm-erlc "${GITHUB_WORKSPACE}/_build/erlc" \
@@ -332,7 +348,7 @@ jobs:
       - name: Benchmark file by file
         if: ${{ !matrix.cross }}
         run: |
-          python3 bench_otp_perfile.py \
+          python3 -u bench_otp_perfile.py \
             --otp otp \
             --runs "${BENCH_RUNS}" \
             --atomvm-erlc "${GITHUB_WORKSPACE}/_build/erlc" \
@@ -372,10 +388,10 @@ jobs:
     # The Emscripten output (AtomVM.mjs + AtomVM.wasm + erlc.avm) is portable,
     # so a single host build produces an artifact that runs under Node anywhere.
     runs-on: ubuntu-24.04
-    # Every invocation pays wasm instantiation on top of the AtomVM startup, so
-    # this flavour is far slower per file than the native ones; hence the
-    # reduced benchmark scope below and the wider budget here.
-    timeout-minutes: 180
+    # The build itself takes about five minutes; the rest is the (deliberately
+    # small, see BENCH_NODE_APPS) benchmark, which is additionally capped step
+    # by step so a single pathological module cannot eat the whole budget.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout atomvm_erlc
@@ -455,31 +471,44 @@ jobs:
           fetch-depth: 1
 
       # Same generated stdlib sources as the native jobs. The current node
-      # corpus does not reach them, but running this here keeps "the OTP source
-      # tree" meaning one thing across both jobs, so widening the node corpus
-      # later cannot silently benchmark an incomplete stdlib.
+      # corpus (sasl, capped) does not reach them, but running this here keeps
+      # "the OTP source tree" meaning one thing across both jobs, so widening
+      # BENCH_NODE_APPS later cannot silently benchmark an incomplete stdlib.
       - name: Generate stdlib's build-time sources
         run: ./generate_otp_sources.sh otp
 
-      # Scoped to the same four applications as the per-file benchmark, and to a
-      # single timed run: the baseline is the same native BEAM erlc as
-      # everywhere else, so these numbers are directly comparable to the native
-      # rows, but a whole-tree three-run pass under wasm would not fit the job.
+      # Scoped to BENCH_NODE_APPS, capped by BENCH_NODE_MAX_BYTES, and to a
+      # single timed run. The baseline is the same native BEAM erlc as
+      # everywhere else, so a row here is directly comparable to the native
+      # rows for the same modules -- but not to the native jobs' totals, which
+      # cover the whole tree uncapped.
+      #
+      # --timeout is per invocation and a whole application is one invocation
+      # here. An overrun is reported as an untimed row rather than waited on;
+      # timeout-minutes then bounds the step itself, because a batch that times
+      # out sends the script into its per-file discovery fallback.
+      #
+      # python3 -u so the rows reach the live log as they are produced rather
+      # than sitting in a pipe buffer until the step ends -- with a flavour this
+      # slow, the buffered version showed nothing at all for hours.
       - name: Benchmark whole applications vs native BEAM erlc
+        timeout-minutes: 30
         run: |
-          python3 bench_otp_erlc.py \
+          python3 -u bench_otp_erlc.py \
             --otp otp \
             --runs 1 \
-            --timeout 1800 \
+            --timeout 300 \
+            --max-bytes "${BENCH_NODE_MAX_BYTES}" \
             --atomvm-erlc "${GITHUB_WORKSPACE}/_build/node/erlc.mjs" \
             --beam-erlc "$(command -v erlc)" \
-            ${BENCH_PERFILE_APPS} 2>&1 | tee bench.txt || true
+            ${BENCH_NODE_APPS} 2>&1 | tee bench.txt || true
           {
             echo "### node (wasm32) -- whole applications"
             echo
             echo "AtomVM \`${ATOMVM_SHA}\` (\`${ATOMVM_REF}\`) AOT-compiled to wasm32 and run"
             echo "under Node, vs the **native** BEAM erlc from OTP ${OTP_VERSION} on the same"
-            echo "runner, over ${BENCH_PERFILE_APPS} of ${OTP_SOURCE_REF}."
+            echo "runner, over ${BENCH_NODE_APPS} of ${OTP_SOURCE_REF}, modules up to"
+            echo "${BENCH_NODE_MAX_BYTES} bytes only."
             echo "Ratios above 1.00x mean AtomVM erlc is faster."
             echo
             echo '```'
@@ -488,20 +517,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Benchmark file by file vs native BEAM erlc
+        timeout-minutes: 30
         run: |
-          python3 bench_otp_perfile.py \
+          python3 -u bench_otp_perfile.py \
             --otp otp \
             --runs 1 \
-            --timeout 1800 \
+            --timeout 300 \
+            --max-bytes "${BENCH_NODE_MAX_BYTES}" \
             --atomvm-erlc "${GITHUB_WORKSPACE}/_build/node/erlc.mjs" \
             --beam-erlc "$(command -v erlc)" \
-            ${BENCH_PERFILE_APPS} 2>&1 | tee bench-perfile.txt || true
+            ${BENCH_NODE_APPS} 2>&1 | tee bench-perfile.txt || true
           {
             echo "### node (wasm32) -- file by file"
             echo
-            echo "One invocation per file over ${BENCH_PERFILE_APPS}, against the same"
-            echo "native BEAM erlc. This is where the wasm instantiation cost shows:"
-            echo "every file pays it in full."
+            echo "One invocation per file over ${BENCH_NODE_APPS} (modules up to"
+            echo "${BENCH_NODE_MAX_BYTES} bytes), against the same native BEAM erlc."
+            echo "This is where the wasm cost shows per module: the ratio is not a"
+            echo "constant, it grows with the size of the module."
             echo "Ratios above 1.00x mean AtomVM erlc is faster."
             echo
             echo '```'
@@ -521,11 +553,16 @@ jobs:
             _build/node/AtomVM.wasm
           if-no-files-found: warn
 
+      # always(), and warn rather than error on missing files: both benchmark
+      # steps tee as they go, so even a step that hits its cap leaves a partial
+      # file worth keeping -- which is exactly the run where the numbers are
+      # most interesting.
       - name: Upload benchmark results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bench-node-wasm32
           path: |
             bench.txt
             bench-perfile.txt
-          if-no-files-found: error
+          if-no-files-found: warn
