@@ -232,9 +232,16 @@ jobs:
             EXTRA="$EXTRA -DZLIB_INCLUDE_DIR=${SDK}/usr/include"
             EXTRA="$EXTRA -DZLIB_LIBRARY=${SDK}/usr/lib/libz.tbd"
           fi
+          # AVM_BUILD_RUNTIME_ONLY drops tests/, examples/ and doc/ from the
+          # configure. Nothing here builds them -- build_erlc.sh only reads
+          # src/AtomVM, tools/packbeam and libs/ -- and tests/CMakeLists.txt
+          # does find_library(LIBRT rt REQUIRED), which the cross build cannot
+          # satisfy: its find root is the sysroot holding zlib, PCRE2 and
+          # Mbed-TLS, and librt lives in the toolchain's own libc instead.
           cmake -S AtomVM -B AtomVM/build.release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DAVM_BUILD_RUNTIME_ONLY=ON \
             -DAVM_DISABLE_JIT=OFF \
             -DAVM_PRECOMPILED_TARGETS="${{ matrix.arch }}" \
             -DAVM_STATIC_MBEDTLS=ON \
