@@ -295,6 +295,17 @@ jobs:
           path: otp
           fetch-depth: 1
 
+      # A source checkout is not the whole corpus: two of stdlib's largest
+      # modules are generated during an OTP build and gitignored, so globbing
+      # lib/stdlib/src silently omits them. unicode_util.erl matters most --
+      # 898 KB, the most expensive module in the tree, and one of the few where
+      # AtomVM erlc loses to BEAM erlc -- so leaving it out flatters the
+      # results. These are the same two generators OTP's own makefiles run, and
+      # they take about a second each.
+      - name: Generate stdlib's build-time sources
+        if: ${{ !matrix.cross }}
+        run: ./generate_otp_sources.sh otp
+
       # The benchmarks exit non-zero when AtomVM erlc is slower in total, which
       # is a result to report rather than a build failure -- hence `|| true`.
       - name: Benchmark whole applications
@@ -442,6 +453,13 @@ jobs:
           ref: ${{ env.OTP_SOURCE_REF }}
           path: otp
           fetch-depth: 1
+
+      # Same generated stdlib sources as the native jobs. The current node
+      # corpus does not reach them, but running this here keeps "the OTP source
+      # tree" meaning one thing across both jobs, so widening the node corpus
+      # later cannot silently benchmark an incomplete stdlib.
+      - name: Generate stdlib's build-time sources
+        run: ./generate_otp_sources.sh otp
 
       # Scoped to the same four applications as the per-file benchmark, and to a
       # single timed run: the baseline is the same native BEAM erlc as
