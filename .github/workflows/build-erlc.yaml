@@ -176,6 +176,10 @@ jobs:
       # macOS has no static libc, so libSystem stays dynamic there.
       - name: Configure AtomVM
         run: |
+          # cmake is piped into tee below, so without pipefail the step takes
+          # tee's exit status and a failed configure is reported as success --
+          # the build then dies on a missing build.ninja with no visible cause.
+          set -o pipefail
           if [ "${{ matrix.cross }}" = "true" ]; then
             # Everything the cross build links against lives in the sysroot the
             # previous step populated. The library paths are pinned explicitly
