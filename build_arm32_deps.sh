@@ -41,12 +41,14 @@ PREFIX="$SYSROOT/usr"
 mkdir -p "$PREFIX"
 
 TOOLCHAIN="$SYSROOT/toolchain.cmake"
-# CMAKE_SYSTEM_PROCESSOR=arm is what makes AtomVM select
-# AVM_JIT_TARGET_ARCH=arm32. No CMAKE_SYSROOT: the compiler must keep using its
-# own libc and headers, only CMake's find_* is confined to this tree.
+# CMAKE_SYSTEM_PROCESSOR is what makes AtomVM select AVM_JIT_TARGET_ARCH=arm32:
+# it matches on "^arm.+$", so a bare "arm" falls through to the FATAL_ERROR
+# branch and armv7l -- what uname -m reports on an armhf system -- is the value
+# to use. No CMAKE_SYSROOT: the compiler must keep using its own libc and
+# headers, only CMake's find_* is confined to this tree.
 cat > "$TOOLCHAIN" <<EOF
 set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSTEM_PROCESSOR arm)
+set(CMAKE_SYSTEM_PROCESSOR armv7l)
 set(CMAKE_C_COMPILER ${CROSS_TRIPLE}-gcc)
 set(CMAKE_CXX_COMPILER ${CROSS_TRIPLE}-g++)
 set(CMAKE_FIND_ROOT_PATH ${SYSROOT})
