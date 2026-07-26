@@ -4,6 +4,21 @@
 #  SPDX-License-Identifier: Apache-2.0 OR LGPL-2.1-or-later
 #
 
+# Builds every flavour of the standalone erlc and benchmarks it against the
+# BEAM erlc it was built with:
+#
+#   macOS   aarch64, x86_64            native, benchmarked
+#   Linux   aarch64, x86_64            native, static, benchmarked
+#   Linux   arm32                      cross-built, static, not benchmarked
+#                                      (no runner can execute it)
+#   Node.js wasm32                     AOT bundle on the Emscripten AtomVM,
+#                                      benchmarked against the same native BEAM
+#
+# Two benchmarks run per flavour: bench_otp_erlc.py compiles each OTP
+# application as one batched invocation (what a real build does), and
+# bench_otp_perfile.py compiles a few applications one file per invocation
+# (what a save hook does, and where per-file outliers show up).
+
 name: Build erlc binaries
 
 on:
@@ -32,10 +47,17 @@ env:
   # Timed runs per application per compiler. One pass over the whole tree is
   # ~65s for BEAM erlc, so 3 runs plus the discovery pass is roughly 15 minutes.
   BENCH_RUNS: "3"
+  # The per-file benchmark is quadratically more expensive in process startups,
+  # so it runs over four representative applications rather than the whole tree:
+  # two large ones and two small ones.
+  BENCH_PERFILE_APPS: "kernel stdlib crypto sasl"
   # PackBEAM and uf2tool are rebar3 projects, so CMake requires rebar3 to
   # configure AtomVM at all.
   REBAR3_VERSION: "3.25.1"
   MBEDTLS_VERSION: "3.6.4"
+  # Only used by the arm32 cross build, which has no distro packages to use.
+  ZLIB_VERSION: "1.3.1"
+  PCRE2_VERSION: "10.45"
 
 jobs:
   build:
@@ -43,7 +65,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # The benchmark bounds each compiler invocation itself; this only stops a
     # runner from idling for hours if something below that wedges.
-    timeout-minutes: 120
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +74,11 @@ jobs:
           - { os: "ubuntu-24.04", arch: "x86_64" }
           - { os: "ubuntu-22.04-arm", arch: "aarch64" }
           - { os: "ubuntu-24.04-arm", arch: "aarch64" }
+          # 32-bit ARM is cross-built from the aarch64 runner: Graviton cannot
+          # execute AArch32 at all, so this flavour is built and checked but
+          # never run, hence no smoke test and no benchmark.
+          - { os: "ubuntu-24.04-arm", arch: "arm32", cross: true,
+              triple: "arm-linux-gnueabihf", debian_arch: "armhf" }
           - { os: "macos-14", arch: "aarch64" }
           - { os: "macos-15", arch: "aarch64" }
           - { os: "macos-15-intel", arch: "x86_64" }
@@ -84,7 +111,22 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev libpcre2-dev
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            # No :armhf dev packages here on purpose -- the runner's apt sources
+            # are not guaranteed to carry that architecture. The C libraries are
+            # cross-built from source in the next step instead; all that is
+            # needed from apt is the cross toolchain itself.
+            sudo apt-get install -y cmake ninja-build gperf \
+              "crossbuild-essential-${{ matrix.debian_arch }}"
+          else
+            sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev libpcre2-dev
+          fi
+
+      - name: Cross-build arm32 dependencies
+        if: matrix.cross
+        env:
+          CROSS_TRIPLE: ${{ matrix.triple }}
+        run: ./build_arm32_deps.sh "${{ github.workspace }}/arm32-sysroot"
 
       # Homebrew ships Mbed-TLS as shared libraries only, so build a static one
       # from source. Mbed-TLS is not optional for this binary: the OTP compiler
@@ -118,7 +160,26 @@ jobs:
       # macOS has no static libc, so libSystem stays dynamic there.
       - name: Configure AtomVM
         run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            # Everything the cross build links against lives in the sysroot the
+            # previous step populated. The library paths are pinned explicitly
+            # rather than left to find_library so a host-architecture archive
+            # can never be picked up, and -I is needed on top of the find root
+            # because check_symbol_exists() only searches the compiler's own
+            # include path.
+            SYSROOT="${{ github.workspace }}/arm32-sysroot"
+            PREFIX="${SYSROOT}/usr"
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=${SYSROOT}/toolchain.cmake"
+            EXTRA="$EXTRA -DCMAKE_C_FLAGS=-I${PREFIX}/include"
+            EXTRA="$EXTRA -DCMAKE_EXE_LINKER_FLAGS=-static"
+            EXTRA="$EXTRA -DZLIB_INCLUDE_DIR=${PREFIX}/include"
+            EXTRA="$EXTRA -DZLIB_LIBRARY=${PREFIX}/lib/libz.a"
+            EXTRA="$EXTRA -DPCRE2_INCLUDE_DIR=${PREFIX}/include"
+            EXTRA="$EXTRA -DPCRE2_8_LIBRARY=${PREFIX}/lib/libpcre2-8.a"
+            EXTRA="$EXTRA -DMBEDCRYPTO=${PREFIX}/lib/libmbedcrypto.a"
+            EXTRA="$EXTRA -DMBEDX509=${PREFIX}/lib/libmbedx509.a"
+            EXTRA="$EXTRA -DMBEDTLS=${PREFIX}/lib/libmbedtls.a"
+          elif [ "${{ runner.os }}" = "Linux" ]; then
             # CMake finds the shared zlib by default, which -static cannot
             # link. Ask the compiler for the static archive zlib1g-dev ships,
             # which avoids hardcoding the multiarch triplet.
@@ -182,13 +243,30 @@ jobs:
           BIN=_build/erlc
           file "$BIN"
           if [ "${{ runner.os }}" = "Linux" ]; then
-            # A fully static binary is not a dynamic executable at all.
-            if ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"; then
-              echo "OK: statically linked"
-            else
-              echo "FAIL: binary still has dynamic dependencies:"
-              ldd "$BIN"
+            # A fully static binary has no PT_INTERP segment and no DT_NEEDED
+            # entries. readelf reads the ELF instead of running it, so this also
+            # works for the arm32 binary, which the aarch64 host cannot execute
+            # and ldd therefore cannot inspect.
+            if readelf -lW "$BIN" | grep -q "INTERP"; then
+              echo "FAIL: binary requests a dynamic loader:"
+              readelf -lW "$BIN" | grep "INTERP"
               exit 1
+            fi
+            if readelf -dW "$BIN" 2>/dev/null | grep -q "NEEDED"; then
+              echo "FAIL: binary still has dynamic dependencies:"
+              readelf -dW "$BIN" | grep "NEEDED"
+              exit 1
+            fi
+            echo "OK: statically linked"
+            if [ "${{ matrix.cross }}" = "true" ]; then
+              # A cross build that silently fell back to the host compiler would
+              # still be static, so check the ELF really targets 32-bit ARM.
+              if ! readelf -hW "$BIN" | grep -qE 'Machine:.*\bARM\b'; then
+                echo "FAIL: not a 32-bit ARM binary:"
+                readelf -hW "$BIN" | grep -E 'Class|Machine'
+                exit 1
+              fi
+              echo "OK: 32-bit ARM"
             fi
           else
             otool -L "$BIN"
@@ -203,24 +281,13 @@ jobs:
           fi
 
       - name: Smoke test
-        run: |
-          mkdir -p smoke && cd smoke
-          cat > smoke_test.erl <<'EOF'
-          -module(smoke_test).
-          -export([fact/1]).
-          fact(0) -> 1;
-          fact(N) when N > 0 -> N * fact(N - 1).
-          EOF
-          "${GITHUB_WORKSPACE}/_build/erlc" -o . smoke_test.erl
-          test -f smoke_test.beam
-          # The module must be loadable and correct on BEAM itself.
-          erl -noshell -pa . -eval 'io:format("~p~n", [smoke_test:fact(10)]), halt().' \
-            | grep -qx 3628800
-          echo "OK: emitted a valid, correct BEAM module"
+        if: ${{ !matrix.cross }}
+        run: ./smoke_test.sh "${GITHUB_WORKSPACE}/_build/erlc"
 
       # Fetched late, and shallow: this is a large repository that is only
       # needed as benchmark input, so nothing earlier has to wait on it.
       - name: Checkout Erlang/OTP ${{ env.OTP_SOURCE_REF }} source
+        if: ${{ !matrix.cross }}
         uses: actions/checkout@v4
         with:
           repository: erlang/otp
@@ -228,9 +295,10 @@ jobs:
           path: otp
           fetch-depth: 1
 
-      # The benchmark exits non-zero when AtomVM erlc is slower in total, which
+      # The benchmarks exit non-zero when AtomVM erlc is slower in total, which
       # is a result to report rather than a build failure -- hence `|| true`.
-      - name: Benchmark against erlc ${{ env.OTP_VERSION }}
+      - name: Benchmark whole applications
+        if: ${{ !matrix.cross }}
         run: |
           python3 bench_otp_erlc.py \
             --otp otp \
@@ -238,14 +306,36 @@ jobs:
             --atomvm-erlc "${GITHUB_WORKSPACE}/_build/erlc" \
             --beam-erlc "$(command -v erlc)" 2>&1 | tee bench.txt || true
           {
-            echo "### ${{ matrix.os }} (${{ matrix.arch }})"
+            echo "### ${{ matrix.os }} (${{ matrix.arch }}) -- whole applications"
             echo
             echo "AtomVM \`${ATOMVM_SHA}\` (\`${ATOMVM_REF}\`) vs BEAM erlc from OTP ${OTP_VERSION},"
-            echo "compiling every application in the ${OTP_SOURCE_REF} source tree."
+            echo "compiling every application in the ${OTP_SOURCE_REF} source tree,"
+            echo "one batched invocation per application."
             echo "Ratios above 1.00x mean AtomVM erlc is faster."
             echo
             echo '```'
             cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Benchmark file by file
+        if: ${{ !matrix.cross }}
+        run: |
+          python3 bench_otp_perfile.py \
+            --otp otp \
+            --runs "${BENCH_RUNS}" \
+            --atomvm-erlc "${GITHUB_WORKSPACE}/_build/erlc" \
+            --beam-erlc "$(command -v erlc)" \
+            ${BENCH_PERFILE_APPS} 2>&1 | tee bench-perfile.txt || true
+          {
+            echo "### ${{ matrix.os }} (${{ matrix.arch }}) -- file by file"
+            echo
+            echo "One compiler invocation per file over ${BENCH_PERFILE_APPS},"
+            echo "so every file pays VM startup on its own."
+            echo "Ratios above 1.00x mean AtomVM erlc is faster."
+            echo
+            echo '```'
+            cat bench-perfile.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -257,8 +347,167 @@ jobs:
           if-no-files-found: error
 
       - name: Upload benchmark results
+        if: ${{ !matrix.cross }}
         uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.os }}-${{ matrix.arch }}
-          path: bench.txt
+          path: |
+            bench.txt
+            bench-perfile.txt
+          if-no-files-found: error
+
+  node:
+    name: node (wasm32)
+    # The Emscripten output (AtomVM.mjs + AtomVM.wasm + erlc.avm) is portable,
+    # so a single host build produces an artifact that runs under Node anywhere.
+    runs-on: ubuntu-24.04
+    # Every invocation pays wasm instantiation on top of the AtomVM startup, so
+    # this flavour is far slower per file than the native ones; hence the
+    # reduced benchmark scope below and the wider budget here.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout atomvm_erlc
+        uses: actions/checkout@v4
+
+      - name: Checkout AtomVM (${{ env.ATOMVM_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ATOMVM_REPOSITORY }}
+          ref: ${{ env.ATOMVM_REF }}
+          path: AtomVM
+
+      - name: Record AtomVM revision
+        run: echo "ATOMVM_SHA=$(git -C AtomVM rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Erlang/OTP ${{ env.OTP_VERSION }}
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+          version-type: loose
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev
+
+      - name: Install Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      # Host build: only the Erlang-side pieces are needed -- the wasm32
+      # precompiler beams, PackBEAM, and the emscripten library precompiled to
+      # wasm32. No native AtomVM binary is produced or required, so wasm32 is
+      # added to AVM_PRECOMPILED_TARGETS and JIT DWARF is left off so wasm32 is
+      # actually emitted.
+      - name: Configure host AtomVM (wasm32 precompiled library)
+        run: |
+          cmake -S AtomVM -B AtomVM/build.host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAVM_DISABLE_JIT=OFF \
+            -DAVM_DISABLE_JIT_DWARF=ON \
+            -DAVM_PRECOMPILED_TARGETS=wasm32
+
+      - name: Build wasm32 library, PackBEAM and precompiler
+        run: cmake --build AtomVM/build.host --target atomvmlib-emscripten PackBEAM
+
+      # Emscripten runtime: the AtomVM.mjs + AtomVM.wasm that runs the wasm32 AOT
+      # code under Node. JIT is left enabled: the runtime registers the AOT wasm
+      # functions through addFunction at load, which needs the JIT link flags.
+      - name: Configure Emscripten AtomVM
+        run: |
+          emcmake cmake -S AtomVM/src/platforms/emscripten -B AtomVM/build.emsdk \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release -DAVM_DISABLE_JIT=OFF
+
+      - name: Build Emscripten AtomVM
+        run: cmake --build AtomVM/build.emsdk --target AtomVM
+
+      - name: Build erlc (Node.js)
+        env:
+          ATOMVM_BUILD: ${{ github.workspace }}/AtomVM/build.host
+          ATOMVM_MJS_DIR: ${{ github.workspace }}/AtomVM/build.emsdk/src
+        run: ./build_erlc_node.sh
+
+      # erlc.mjs carries a `node` shebang, so the benchmarks can drive it as a
+      # plain executable; the smoke test uses the same path to prove that.
+      - name: Smoke test (Node.js)
+        run: ./smoke_test.sh "${GITHUB_WORKSPACE}/_build/node/erlc.mjs"
+
+      - name: Checkout Erlang/OTP ${{ env.OTP_SOURCE_REF }} source
+        uses: actions/checkout@v4
+        with:
+          repository: erlang/otp
+          ref: ${{ env.OTP_SOURCE_REF }}
+          path: otp
+          fetch-depth: 1
+
+      # Scoped to the same four applications as the per-file benchmark, and to a
+      # single timed run: the baseline is the same native BEAM erlc as
+      # everywhere else, so these numbers are directly comparable to the native
+      # rows, but a whole-tree three-run pass under wasm would not fit the job.
+      - name: Benchmark whole applications vs native BEAM erlc
+        run: |
+          python3 bench_otp_erlc.py \
+            --otp otp \
+            --runs 1 \
+            --timeout 1800 \
+            --atomvm-erlc "${GITHUB_WORKSPACE}/_build/node/erlc.mjs" \
+            --beam-erlc "$(command -v erlc)" \
+            ${BENCH_PERFILE_APPS} 2>&1 | tee bench.txt || true
+          {
+            echo "### node (wasm32) -- whole applications"
+            echo
+            echo "AtomVM \`${ATOMVM_SHA}\` (\`${ATOMVM_REF}\`) AOT-compiled to wasm32 and run"
+            echo "under Node, vs the **native** BEAM erlc from OTP ${OTP_VERSION} on the same"
+            echo "runner, over ${BENCH_PERFILE_APPS} of ${OTP_SOURCE_REF}."
+            echo "Ratios above 1.00x mean AtomVM erlc is faster."
+            echo
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Benchmark file by file vs native BEAM erlc
+        run: |
+          python3 bench_otp_perfile.py \
+            --otp otp \
+            --runs 1 \
+            --timeout 1800 \
+            --atomvm-erlc "${GITHUB_WORKSPACE}/_build/node/erlc.mjs" \
+            --beam-erlc "$(command -v erlc)" \
+            ${BENCH_PERFILE_APPS} 2>&1 | tee bench-perfile.txt || true
+          {
+            echo "### node (wasm32) -- file by file"
+            echo
+            echo "One invocation per file over ${BENCH_PERFILE_APPS}, against the same"
+            echo "native BEAM erlc. This is where the wasm instantiation cost shows:"
+            echo "every file pays it in full."
+            echo "Ratios above 1.00x mean AtomVM erlc is faster."
+            echo
+            echo '```'
+            cat bench-perfile.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Node.js erlc bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: erlc-node-wasm32
+          path: |
+            _build/node/erlc.mjs
+            _build/node/erlc.avm
+            _build/node/AtomVM.mjs
+            _build/node/AtomVM.wasm
+          if-no-files-found: warn
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-node-wasm32
+          path: |
+            bench.txt
+            bench-perfile.txt
           if-no-files-found: error
