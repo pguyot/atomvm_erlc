@@ -20,10 +20,21 @@ STDLIB_EBIN=$(ls -d "$OTP_LIB"/stdlib-*/ebin | head -1)
 STDLIB_MODULES="${STDLIB_MODULES:-erl_scan erl_parse erl_lint erl_anno epp
     erl_internal erl_features erl_bits otp_internal erl_eval eval_bits erl_error
     ordsets orddict dict gb_sets gb_trees digraph digraph_utils sofs
-    beam_lib filelib graph records erl_expand_records erl_pp rand
+    beam_lib filelib erl_expand_records erl_pp rand
     io_lib io_lib_format io_lib_fread io_lib_pretty string unicode_util}"
+
+# stdlib modules that exist only in some releases: graph and records are new in
+# OTP 29, where the compiler uses them. Copied when the toolchain has them and
+# skipped otherwise, so the same script works against OTP 27, 28 and 29 -- an
+# unconditional cp would simply fail on the two older ones.
+STDLIB_MODULES_OPTIONAL="${STDLIB_MODULES_OPTIONAL:-graph records}"
 
 cp "$COMPILER_EBIN"/*.beam "$EBIN/"
 for m in $STDLIB_MODULES; do
     cp "$STDLIB_EBIN/$m.beam" "$EBIN/"
+done
+for m in $STDLIB_MODULES_OPTIONAL; do
+    if [ -f "$STDLIB_EBIN/$m.beam" ]; then
+        cp "$STDLIB_EBIN/$m.beam" "$EBIN/"
+    fi
 done

@@ -14,6 +14,11 @@
 #   Node.js wasm32                     AOT bundle on the Emscripten AtomVM,
 #                                      benchmarked against the same native BEAM
 #
+# Each flavour is built once per supported OTP release (see the otp matrix
+# below). The OTP version is not a build detail: the compiler and stdlib beams
+# of the toolchain are packed into the binary, so an erlc built on OTP 27 emits
+# OTP 27 BEAM files. Hence one artifact per (OTP version, platform) pair.
+#
 # Two benchmarks run per flavour: bench_otp_erlc.py compiles each OTP
 # application as one batched invocation (what a real build does), and
 # bench_otp_perfile.py compiles a few applications one file per invocation
@@ -37,13 +42,10 @@ env:
   # AtomVM revision the binaries are built from.
   ATOMVM_REPOSITORY: "pguyot/AtomVM"
   ATOMVM_REF: "w30/jit-edge"
-  # OTP 29 is both the build toolchain (the OTP compiler and stdlib beams are
-  # packed into the binary) and the benchmark baseline.
-  OTP_VERSION: "29"
-  # The benchmark corpus: every application in this OTP source tree is compiled
-  # by both compilers. Pinned to a tag so the corpus does not drift between
-  # runs; only the sources are read, nothing is built from it.
-  OTP_SOURCE_REF: "OTP-29.0"
+  # OTP_VERSION and OTP_SOURCE_REF are per-job, set from the otp matrix: each
+  # release builds its own binaries, is benchmarked against its own BEAM erlc,
+  # and compiles its own source tree.
+  #
   # Timed runs per application per compiler. One pass over the whole tree is
   # ~65s for BEAM erlc, so 3 runs plus the discovery pass is roughly 15 minutes.
   BENCH_RUNS: "3"
@@ -77,15 +79,35 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.os }} (${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
+    name: OTP ${{ matrix.otp.version }} ${{ matrix.platform.os }} (${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.os }}
     # The benchmark bounds each compiler invocation itself; this only stops a
     # runner from idling for hours if something below that wedges.
     timeout-minutes: 150
     strategy:
       fail-fast: false
+      # Both dimensions are lists of objects rather than an `include:` list:
+      # `include:` entries that all set the same key (os) would overwrite one
+      # another instead of multiplying out, so a full cross product of releases
+      # and platforms has to be expressed as two matrix keys.
       matrix:
-        include:
+        # AtomVM w30/jit-edge supports OTP 27 and later. setup-beam is asked
+        # for the bare major with version-type: loose, so each job picks up the
+        # newest release of that line at run time.
+        #
+        # source_ref is the benchmark corpus, and it tracks the release rather
+        # than being shared: an OTP 27 compiler is not expected to compile the
+        # OTP 29 tree, and a ratio is only meaningful when both compilers are
+        # given the sources of their own release. Pinned to a tag so the corpus
+        # does not drift between runs -- 29 stays on the tag it was already
+        # pinned to, so its numbers stay comparable with earlier runs; 27 and
+        # 28 use the newest release of their series. Only the sources are read,
+        # nothing is built from these trees.
+        otp:
+          - { version: "27", source_ref: "OTP-27.3.4.15" }
+          - { version: "28", source_ref: "OTP-28.5.0.4" }
+          - { version: "29", source_ref: "OTP-29.0" }
+        platform:
           - { os: "ubuntu-22.04", arch: "x86_64" }
           - { os: "ubuntu-24.04", arch: "x86_64" }
           - { os: "ubuntu-22.04-arm", arch: "aarch64" }
@@ -100,6 +122,10 @@ jobs:
           - { os: "macos-15-intel", arch: "x86_64" }
           - { os: "macos-26", arch: "aarch64" }
           - { os: "macos-26-intel", arch: "x86_64" }
+
+    env:
+      OTP_VERSION: ${{ matrix.otp.version }}
+      OTP_SOURCE_REF: ${{ matrix.otp.source_ref }}
 
     steps:
       - name: Checkout atomvm_erlc
@@ -116,10 +142,10 @@ jobs:
         run: |
           echo "ATOMVM_SHA=$(git -C AtomVM rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Install Erlang/OTP ${{ env.OTP_VERSION }}
+      - name: Install Erlang/OTP ${{ matrix.otp.version }}
         uses: erlef/setup-beam@v1
         with:
-          otp-version: ${{ env.OTP_VERSION }}
+          otp-version: ${{ matrix.otp.version }}
           rebar3-version: ${{ env.REBAR3_VERSION }}
           version-type: loose
 
@@ -127,21 +153,21 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          if [ "${{ matrix.cross }}" = "true" ]; then
+          if [ "${{ matrix.platform.cross }}" = "true" ]; then
             # No :armhf dev packages here on purpose -- the runner's apt sources
             # are not guaranteed to carry that architecture. The C libraries are
             # cross-built from source in the next step instead; all that is
             # needed from apt is the cross toolchain itself.
             sudo apt-get install -y cmake ninja-build gperf \
-              "crossbuild-essential-${{ matrix.debian_arch }}"
+              "crossbuild-essential-${{ matrix.platform.debian_arch }}"
           else
             sudo apt-get install -y cmake ninja-build gperf zlib1g-dev libmbedtls-dev libpcre2-dev
           fi
 
       - name: Cross-build arm32 dependencies
-        if: matrix.cross
+        if: matrix.platform.cross
         env:
-          CROSS_TRIPLE: ${{ matrix.triple }}
+          CROSS_TRIPLE: ${{ matrix.platform.triple }}
         run: ./build_arm32_deps.sh "${{ github.workspace }}/arm32-sysroot"
 
       # Homebrew ships Mbed-TLS as shared libraries only, so build a static one
@@ -180,7 +206,7 @@ jobs:
           # tee's exit status and a failed configure is reported as success --
           # the build then dies on a missing build.ninja with no visible cause.
           set -o pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
+          if [ "${{ matrix.platform.cross }}" = "true" ]; then
             # Everything the cross build links against lives in the sysroot the
             # previous step populated. The library paths are pinned explicitly
             # rather than left to find_library so a host-architecture archive
@@ -243,7 +269,7 @@ jobs:
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
             -DAVM_BUILD_RUNTIME_ONLY=ON \
             -DAVM_DISABLE_JIT=OFF \
-            -DAVM_PRECOMPILED_TARGETS="${{ matrix.arch }}" \
+            -DAVM_PRECOMPILED_TARGETS="${{ matrix.platform.arch }}" \
             -DAVM_STATIC_MBEDTLS=ON \
             -DCMAKE_DISABLE_FIND_PACKAGE_MbedTLS=ON \
             $EXTRA 2>&1 | tee configure.log
@@ -262,7 +288,7 @@ jobs:
       - name: Build erlc
         env:
           ATOMVM_BUILD: ${{ github.workspace }}/AtomVM/build.release
-          TARGET: ${{ matrix.arch }}
+          TARGET: ${{ matrix.platform.arch }}
         run: ./build_erlc.sh
 
       - name: Verify the binary is self-contained
@@ -285,7 +311,7 @@ jobs:
               exit 1
             fi
             echo "OK: statically linked"
-            if [ "${{ matrix.cross }}" = "true" ]; then
+            if [ "${{ matrix.platform.cross }}" = "true" ]; then
               # A cross build that silently fell back to the host compiler would
               # still be static, so check the ELF really targets 32-bit ARM.
               if ! readelf -hW "$BIN" | grep -qE 'Machine:.*\bARM\b'; then
@@ -308,17 +334,17 @@ jobs:
           fi
 
       - name: Smoke test
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.platform.cross }}
         run: ./smoke_test.sh "${GITHUB_WORKSPACE}/_build/erlc"
 
       # Fetched late, and shallow: this is a large repository that is only
       # needed as benchmark input, so nothing earlier has to wait on it.
-      - name: Checkout Erlang/OTP ${{ env.OTP_SOURCE_REF }} source
-        if: ${{ !matrix.cross }}
+      - name: Checkout Erlang/OTP ${{ matrix.otp.source_ref }} source
+        if: ${{ !matrix.platform.cross }}
         uses: actions/checkout@v4
         with:
           repository: erlang/otp
-          ref: ${{ env.OTP_SOURCE_REF }}
+          ref: ${{ matrix.otp.source_ref }}
           path: otp
           fetch-depth: 1
 
@@ -330,13 +356,13 @@ jobs:
       # results. These are the same two generators OTP's own makefiles run, and
       # they take about a second each.
       - name: Generate stdlib's build-time sources
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.platform.cross }}
         run: ./generate_otp_sources.sh otp
 
       # The benchmarks exit non-zero when AtomVM erlc is slower in total, which
       # is a result to report rather than a build failure -- hence `|| true`.
       - name: Benchmark whole applications
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.platform.cross }}
         run: |
           python3 -u bench_otp_erlc.py \
             --otp otp \
@@ -344,7 +370,7 @@ jobs:
             --atomvm-erlc "${GITHUB_WORKSPACE}/_build/erlc" \
             --beam-erlc "$(command -v erlc)" 2>&1 | tee bench.txt || true
           {
-            echo "### ${{ matrix.os }} (${{ matrix.arch }}) -- whole applications"
+            echo "### OTP ${{ matrix.otp.version }} ${{ matrix.platform.os }} (${{ matrix.platform.arch }}) -- whole applications"
             echo
             echo "AtomVM \`${ATOMVM_SHA}\` (\`${ATOMVM_REF}\`) vs BEAM erlc from OTP ${OTP_VERSION},"
             echo "compiling every application in the ${OTP_SOURCE_REF} source tree,"
@@ -357,7 +383,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Benchmark file by file
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.platform.cross }}
         run: |
           python3 -u bench_otp_perfile.py \
             --otp otp \
@@ -366,7 +392,7 @@ jobs:
             --beam-erlc "$(command -v erlc)" \
             ${BENCH_PERFILE_APPS} 2>&1 | tee bench-perfile.txt || true
           {
-            echo "### ${{ matrix.os }} (${{ matrix.arch }}) -- file by file"
+            echo "### OTP ${{ matrix.otp.version }} ${{ matrix.platform.os }} (${{ matrix.platform.arch }}) -- file by file"
             echo
             echo "One compiler invocation per file over ${BENCH_PERFILE_APPS},"
             echo "so every file pays VM startup on its own."
@@ -377,32 +403,49 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The OTP version is part of the artifact name, not decoration: the same
+      # platform now produces three different binaries, one per release, and
+      # upload-artifact rejects a name that is already taken in the run.
       - name: Upload erlc binary
         uses: actions/upload-artifact@v4
         with:
-          name: erlc-${{ matrix.os }}-${{ matrix.arch }}
+          name: erlc-otp${{ matrix.otp.version }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: _build/erlc
           if-no-files-found: error
 
       - name: Upload benchmark results
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.platform.cross }}
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.os }}-${{ matrix.arch }}
+          name: bench-otp${{ matrix.otp.version }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: |
             bench.txt
             bench-perfile.txt
           if-no-files-found: error
 
   node:
-    name: node (wasm32)
+    name: OTP ${{ matrix.otp.version }} node (wasm32)
     # The Emscripten output (AtomVM.mjs + AtomVM.wasm + erlc.avm) is portable,
     # so a single host build produces an artifact that runs under Node anywhere.
+    # It is still built once per OTP release: what is portable is the platform,
+    # not the compiler packed into the bundle.
     runs-on: ubuntu-24.04
     # The build itself takes about five minutes; the rest is the (deliberately
     # small, see BENCH_NODE_APPS) benchmark, which is additionally capped step
     # by step so a single pathological module cannot eat the whole budget.
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Same releases and pinned corpora as the native jobs above.
+      matrix:
+        otp:
+          - { version: "27", source_ref: "OTP-27.3.4.15" }
+          - { version: "28", source_ref: "OTP-28.5.0.4" }
+          - { version: "29", source_ref: "OTP-29.0" }
+
+    env:
+      OTP_VERSION: ${{ matrix.otp.version }}
+      OTP_SOURCE_REF: ${{ matrix.otp.source_ref }}
 
     steps:
       - name: Checkout atomvm_erlc
@@ -418,10 +461,10 @@ jobs:
       - name: Record AtomVM revision
         run: echo "ATOMVM_SHA=$(git -C AtomVM rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Install Erlang/OTP ${{ env.OTP_VERSION }}
+      - name: Install Erlang/OTP ${{ matrix.otp.version }}
         uses: erlef/setup-beam@v1
         with:
-          otp-version: ${{ env.OTP_VERSION }}
+          otp-version: ${{ matrix.otp.version }}
           rebar3-version: ${{ env.REBAR3_VERSION }}
           version-type: loose
 
@@ -473,11 +516,11 @@ jobs:
       - name: Smoke test (Node.js)
         run: ./smoke_test.sh "${GITHUB_WORKSPACE}/_build/node/erlc.mjs"
 
-      - name: Checkout Erlang/OTP ${{ env.OTP_SOURCE_REF }} source
+      - name: Checkout Erlang/OTP ${{ matrix.otp.source_ref }} source
         uses: actions/checkout@v4
         with:
           repository: erlang/otp
-          ref: ${{ env.OTP_SOURCE_REF }}
+          ref: ${{ matrix.otp.source_ref }}
           path: otp
           fetch-depth: 1
 
@@ -514,7 +557,7 @@ jobs:
             --beam-erlc "$(command -v erlc)" \
             ${BENCH_NODE_APPS} 2>&1 | tee bench.txt || true
           {
-            echo "### node (wasm32) -- whole applications"
+            echo "### OTP ${{ matrix.otp.version }} node (wasm32) -- whole applications"
             echo
             echo "AtomVM \`${ATOMVM_SHA}\` (\`${ATOMVM_REF}\`) AOT-compiled to wasm32 and run"
             echo "under Node, vs the **native** BEAM erlc from OTP ${OTP_VERSION} on the same"
@@ -539,7 +582,7 @@ jobs:
             --beam-erlc "$(command -v erlc)" \
             ${BENCH_NODE_APPS} 2>&1 | tee bench-perfile.txt || true
           {
-            echo "### node (wasm32) -- file by file"
+            echo "### OTP ${{ matrix.otp.version }} node (wasm32) -- file by file"
             echo
             echo "One invocation per file over ${BENCH_NODE_APPS} (modules up to"
             echo "${BENCH_NODE_MAX_BYTES} bytes), against the same native BEAM erlc."
@@ -556,7 +599,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: erlc-node-wasm32
+          name: erlc-node-wasm32-otp${{ matrix.otp.version }}
           path: |
             _build/node/erlc.mjs
             _build/node/erlc.avm
@@ -572,7 +615,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-node-wasm32
+          name: bench-node-wasm32-otp${{ matrix.otp.version }}
           path: |
             bench.txt
             bench-perfile.txt
